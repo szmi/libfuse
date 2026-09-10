@@ -51,6 +51,7 @@ typedef struct fuse_req *fuse_req_t;
 
 /* Forward declaration */
 struct statx;
+struct fuse_extent;
 
 /**
  * Session
@@ -102,6 +103,9 @@ struct fuse_entry_param {
 	    that come through the kernel, this should be set to a very
 	    large value. */
 	double entry_timeout;
+
+	/** Inode is DAX */
+	bool dax;
 };
 
 /**
@@ -1357,43 +1361,6 @@ struct fuse_lowlevel_ops {
 	 * @param ino the inode number
 	 */
 	void (*syncfs)(fuse_req_t req, fuse_ino_t ino);
-
-	/**
-	 * Get a famfs/devdax/fsdax fmap
-	 *
-	 * Retrieve a file map (aka fmap) for a previously looked-up file.
-	 * The fmap is serialized into the buffer, anchored by
-	 * struct fuse_famfs_fmap_header, followed by one or more
-	 * structs fuse_famfs_simple_ext, or fuse_famfs_iext (which itself
-	 * is followed by one or more fuse_famfs_simple_ext...
-	 *
-	 * Valid replies:
-	 *    fuse_reply_buf  (TODO: variable-size reply)
-	 *    fuse_reply_err
-	 *
-	 * @param req request handle
-	 * @param ino the inode number
-	 */
-	void (*get_fmap) (fuse_req_t req, fuse_ino_t ino, size_t size);
-
-	/**
-	 * Get a daxdev by index
-	 *
-	 * Retrieve info on a daxdev by index. This will be called any time
-	 * GET_FMAP has returned a file map that references a previously
-	 * unused daxdev. struct famfs_simple_ext, which is used for all
-	 * resolutions to daxdev offsets, references daxdevs by index.
-	 * In user space we maintain a master list of all referenced daxdevs
-	 * by index, which is queried by get_daxdev.
-	 *
-	 * Valid replies:
-	 *    fuse_reply_buf
-	 *    fuse_reply_err
-	 *
-	 * @param req request handle
-	 * @param ino the index of the daxdev
-	 */
-	void (*get_daxdev) (fuse_req_t req, int daxdev_index);
 };
 
 /**
@@ -1508,18 +1475,17 @@ int fuse_reply_readlink(fuse_req_t req, const char *link);
 int fuse_passthrough_open(fuse_req_t req, int fd);
 int fuse_passthrough_close(fuse_req_t req, int backing_id);
 
-/**
- * Pass a famfs DAX device into the kernel for an open reply
- *
- * Registers a dax device (by fd) with the kernel via the backing-open
- * ioctl so that famfs/fuse can map files backed by it.
- *
- * @param req request handle
- * @param fd dax device file descriptor
- * @param devindex daxdev index to associate with the backing fd
- * @return positive backing id for success, 0 for failure
- */
-int fuse_daxdev_open(fuse_req_t req, int fd, int devindex);
+struct fuse_passthrough_param {
+	uint64_t backing_id;
+	bool is_dev;	/* fd refers to a device */
+	bool is_64bit;  /* backing id is 64 bit and allocated by the server */
+};
+
+/* New passthrough API using server allocated 64 bit backing ID's */
+
+#define FUSE_PASSTHROUGH_IS_DEV	(1 << 0)
+int fuse_passthrough_open2(struct fuse_session *se, int fd, uint64_t backing_id, int flags);
+int fuse_passthrough_close2(struct fuse_session *se, uint64_t backing_id);
 
 /**
  * Reply with open parameters
@@ -2025,6 +1991,12 @@ int fuse_lowlevel_notify_retrieve(struct fuse_session *se, fuse_ino_t ino,
 int fuse_lowlevel_notify_prune(struct fuse_session *se,
 			       fuse_ino_t *nodeids, uint32_t count);
 
+#define FUSE_EXT_MAP_CREATE (1 << 0)
+#define FUSE_EXT_MAP_CYCLIC (1 << 1)
+int fuse_ext_map_populate(struct fuse_session *se, uint64_t backing_id,
+			  unsigned int num_ext, struct fuse_extent *ext,
+			  unsigned int flags);
+
 /* ----------------------------------------------------------- *
  * Utility functions					       *
  * ----------------------------------------------------------- */
@@ -2099,6 +2071,7 @@ void fuse_req_interrupt_func(fuse_req_t req, fuse_interrupt_func_t func,
  */
 int fuse_req_interrupted(fuse_req_t req);
 
+struct fuse_session *fuse_req_session(fuse_req_t req);
 
 /* ----------------------------------------------------------- *
  * Inquiry functions                                           *

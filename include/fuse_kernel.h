@@ -242,14 +242,24 @@
  *  - add FUSE_NOTIFY_PRUNE
  *
  *  7.46
- *  - Add FUSE_DAX_FMAP capability - ability to handle in-kernel fsdax maps
- *  - Add the following structures for the GET_FMAP message reply components:
- *    - struct fuse_famfs_simple_ext
- *    - struct fuse_famfs_iext
- *    - struct fuse_famfs_fmap_header
- *  - Add the following enumerated types
- *    - enum fuse_famfs_file_type
- *    - enum famfs_ext_type
+ *  - add FUSE_IO_URING_CMD_ADD_QUEUE
+ *  - add FUSE_HAS_IO_URING_BUFPOOL
+ *  - add fuse_uring_cmd_req bufpool struct
+ *  - add bufpool offset field to fuse_uring_ent_in_out struct
+ *  - add FUSE_URING_ZERO_COPY, FUSE_URING_ENT_ZERO_COPY, and
+ *    FOPEN_IO_URING_ZERO_COPY flag
+ *
+ *  7.47
+ *  - add FUSE_HAS_SYNCFS opt-in flag for privileged userspace servers
+ *  - add FUSE_NOTIFY_BACKING_CLOSE, FUSE_NOTIFY_MAP
+ *  - add struct fuse_notify_backing_close_out
+ *  - add struct fuse_notify_map_out
+ *  - add struct fuse_extent
+ *  - add backing_id_64 to fuse_open_out
+ *  - add backing_id to fuse_backing_map
+ *  - add FUSE_BACKING_IS_DEV (fuse_backing_map.flags)
+ *  - add FUSE_BACKING_ID_64 (mutiple structs)
+ *  - add FUSE_MAP_CYCLIC, FUSE_MAP_BACKING_CREATE (fuse_map_out.flags)
  */
 
 #ifndef _LINUX_FUSE_H
@@ -285,7 +295,7 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 45
+#define FUSE_KERNEL_MINOR_VERSION 47
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
@@ -393,6 +403,13 @@ struct fuse_file_lock {
  * FOPEN_NOFLUSH: don't flush data cache on close (unless FUSE_WRITEBACK_CACHE)
  * FOPEN_PARALLEL_DIRECT_WRITES: Allow concurrent direct writes on the same inode
  * FOPEN_PASSTHROUGH: passthrough read/write io for this open file
+ * FOPEN_IO_URING_ZERO_COPY: use io-uring zero-copy for reads/writes on this
+ *                           open file. Honored only when the serving io-uring
+ *                           queue was set up for zero-copy
+ *                           (FUSE_URING_ZERO_COPY) and the request carries page
+ *                           payload. Otherwise reads/writes fall back to
+ *                           copying.
+ * FUSE_BACKING_ID_64: backing ID is server allocated, stored in open_out.backing_id_64
  */
 #define FOPEN_DIRECT_IO		(1 << 0)
 #define FOPEN_KEEP_CACHE	(1 << 1)
@@ -402,6 +419,8 @@ struct fuse_file_lock {
 #define FOPEN_NOFLUSH		(1 << 5)
 #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
 #define FOPEN_PASSTHROUGH	(1 << 7)
+#define FOPEN_IO_URING_ZERO_COPY (1 << 8)
+#define FUSE_BACKING_ID_64	(1 << 30) /* used in multiple structs */
 
 /**
  * INIT request/reply flags
@@ -458,7 +477,13 @@ struct fuse_file_lock {
  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
  *			 init_out.request_timeout contains the timeout (in secs)
- * FUSE_DAX_FMAP: kernel supports dev_dax_iomap (aka famfs) fmaps
+ * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools
+ * FUSE_HAS_SYNCFS: server requests that syncfs()/sync() be propagated as
+ *		FUSE_SYNCFS requests.  Since an untrusted server can use this
+ *		to stall sync(), it is only honored when /dev/fuse was opened
+ *		with CAP_SYS_ADMIN in the initial user namespace (the same
+ *		privilege that mounting virtiofs or fuseblk requires).
+ *		Insufficiently privileged servers ignore it.
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -506,7 +531,8 @@ struct fuse_file_lock {
 #define FUSE_ALLOW_IDMAP	(1ULL << 40)
 #define FUSE_OVER_IO_URING	(1ULL << 41)
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
-#define FUSE_DAX_FMAP		(1ULL << 43)
+#define FUSE_HAS_IO_URING_BUFPOOL (1ULL << 43)
+#define FUSE_HAS_SYNCFS		(1ULL << 44)
 
 /**
  * CUSE INIT request/reply flags
@@ -676,10 +702,6 @@ enum fuse_opcode {
 	FUSE_STATX		= 52,
 	FUSE_COPY_FILE_RANGE_64	= 53,
 
-	/* Famfs / devdax opcodes */
-	FUSE_GET_FMAP           = 54,
-	FUSE_GET_DAXDEV         = 55,
-
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
 
@@ -698,6 +720,8 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_RESEND = 7,
 	FUSE_NOTIFY_INC_EPOCH = 8,
 	FUSE_NOTIFY_PRUNE = 9,
+	FUSE_NOTIFY_BACKING_CLOSE = 10,
+	FUSE_NOTIFY_MAP = 11,
 };
 
 /* The read buffer is required to be at least 8k, but may be much larger */
@@ -824,6 +848,7 @@ struct fuse_open_out {
 	uint64_t	fh;
 	uint32_t	open_flags;
 	int32_t		backing_id;
+	uint64_t	backing_id_64;
 };
 
 struct fuse_release_in {
@@ -1142,13 +1167,19 @@ struct fuse_notify_prune_out {
 	uint64_t	spare;
 };
 
+/**
+ * flags for fuse_backing_map
+ *
+ * FUSE_BACKING_IS_DEV: @fd refers to a device file
+ * FUSE_BACKING_ID_64: backing ID is server allocated, stored in @backing_id
+ */
+#define FUSE_BACKING_IS_DEV	(1 << 0)
+#define FUSE_BACKING_ID_64	(1 << 30) /* used in multiple structs */
+
 struct fuse_backing_map {
 	int32_t		fd;
 	uint32_t	flags;
-	union {
-		uint64_t	padding;
-		uint64_t	daxdev_index;	/* FUSE_DEV_IOC_DAXDEV_OPEN */
-	};
+	uint64_t	backing_id;
 };
 
 /* Device ioctls: */
@@ -1158,8 +1189,6 @@ struct fuse_backing_map {
 					     struct fuse_backing_map)
 #define FUSE_DEV_IOC_BACKING_CLOSE	_IOW(FUSE_DEV_IOC_MAGIC, 2, uint32_t)
 #define FUSE_DEV_IOC_SYNC_INIT		_IO(FUSE_DEV_IOC_MAGIC, 3)
-#define FUSE_DEV_IOC_DAXDEV_OPEN	_IOW(FUSE_DEV_IOC_MAGIC, 4, \
-					     struct fuse_backing_map)
 
 struct fuse_lseek_in {
 	uint64_t	fh;
@@ -1185,6 +1214,37 @@ struct fuse_copy_file_range_in {
 /* For FUSE_COPY_FILE_RANGE_64 */
 struct fuse_copy_file_range_out {
 	uint64_t	bytes_copied;
+};
+
+struct fuse_notify_backing_close_out {
+	uint64_t	backing_id;
+	uint64_t	reserved;
+};
+
+/**
+ * notify_map flags
+ *
+ * FUSE_MAP_BACKING_CREATE:	create backing with the supplied ID
+ * FUSE_MAP_CYCLIC:		map repeats after last extent
+ */
+#define FUSE_MAP_BACKING_CREATE	(1 << 0)
+#define FUSE_MAP_CYCLIC		(1 << 1)
+
+struct fuse_notify_map_out {
+	uint64_t	backing_id;
+	uint32_t	num_extents;
+	uint32_t	flags;
+	uint64_t	reserved[2];
+};
+
+#define FUSE_MAX_EXTENTS 1638
+
+struct fuse_extent {
+	uint64_t	offset;		/* offset of extent into file */
+	uint64_t	length;		/* extent length */
+	uint64_t	backing_id;	/* target backing */
+	uint64_t	addr;		/* target offset within backing file/device */
+	uint64_t	reserved[2];
 };
 
 #define FUSE_SETUPMAPPING_FLAG_WRITE (1ull << 0)
@@ -1272,6 +1332,13 @@ struct fuse_supp_groups {
 #define FUSE_URING_IN_OUT_HEADER_SZ 128
 #define FUSE_URING_OP_IN_OUT_SZ 128
 
+/**
+ * fuse_uring_ent_in_out flags
+ *
+ * FUSE_URING_ENT_ZERO_COPY: Set if the ent's payload is zero-copied
+ */
+#define FUSE_URING_ENT_ZERO_COPY	(1 << 0)
+
 /* Used as part of the fuse_uring_req_header */
 struct fuse_uring_ent_in_out {
 	uint64_t flags;
@@ -1284,7 +1351,9 @@ struct fuse_uring_ent_in_out {
 
 	/* size of user payload buffer */
 	uint32_t payload_sz;
-	uint32_t padding;
+
+	/* Offset into the bufpool, if bufpools are used */
+	uint32_t offset;
 
 	uint64_t reserved;
 };
@@ -1313,7 +1382,21 @@ enum fuse_uring_cmd {
 
 	/* commit fuse request result and fetch next request */
 	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+
+	/* add a queue */
+	FUSE_IO_URING_CMD_ADD_QUEUE = 3,
+
+	/* add a bufpool to a queue */
+	FUSE_IO_URING_CMD_ADD_BUFPOOL = 4,
 };
+
+/*
+ * fuse_uring_cmd_req flags for FUSE_IO_URING_CMD_ADD_QUEUE
+ *
+ * FUSE_URING_ZERO_COPY is only supported for queues with bufpools on privileged
+ * servers
+ */
+#define FUSE_URING_ZERO_COPY		(1 << 0)
 
 /**
  * In the 80B command area of the SQE.
@@ -1327,89 +1410,25 @@ struct fuse_uring_cmd_req {
 	/* queue the command is for (queue index) */
 	uint16_t qid;
 	uint8_t padding[6];
+
+	union {
+		struct {
+			/* base address of bufpool */
+			uint64_t uaddr;
+			uint32_t len;
+			uint32_t reserved;
+		} bufpool;
+
+		/*
+		 * Index of this entry's slot in the server's io_uring
+		 * registered buffer table, where the kernel registers the
+		 * request's pages for zero-copy. Set for
+		 * FUSE_IO_URING_CMD_REGISTER cmds only, and only on queues
+		 * created with FUSE_URING_ZERO_COPY. On a non-zero-copy queue
+		 * this must be 0
+		 */
+		uint16_t ent_zero_copy_buf_index;
+	};
 };
-
-/* Famfs fmap message components */
-
-#define FAMFS_FMAP_VERSION 1
-
-#define FAMFS_FMAP_MAX 32768 /* Largest supported fmap message */
-/*
- * Upper bound on the number of simple extents in one GET_FMAP fmap. A striped
- * file is unrolled to one extent per chunk, so this caps the striped-file size
- * and, with the header + extent sizes, the largest GET_FMAP reply buffer the
- * kernel will kvmalloc for the size-probe retry. 524288 extents => ~1 TiB per
- * striped file at a 2 MiB chunk, and a ~12 MiB max reply buffer. Tunable.
- */
-#define FUSE_FAMFS_MAX_EXTENTS 524288
-#define FUSE_FAMFS_MAX_STRIPS 32
-
-enum fuse_famfs_file_type {
-	FUSE_FAMFS_FILE_REG,
-	FUSE_FAMFS_FILE_SUPERBLOCK,
-	FUSE_FAMFS_FILE_LOG,
-};
-
-enum famfs_ext_type {
-	FUSE_FAMFS_EXT_SIMPLE = 0,
-	FUSE_FAMFS_EXT_INTERLEAVE = 1,
-};
-
-struct fuse_famfs_simple_ext {
-	uint32_t se_devindex;
-	uint32_t reserved;
-	uint64_t se_offset;
-	uint64_t se_len;
-};
-
-struct fuse_famfs_iext { /* Interleaved extent */
-	uint32_t ie_nstrips;
-	uint32_t ie_chunk_size;
-	uint64_t ie_nbytes; /* Total bytes for this interleaved_ext;
-			     * sum of strips may be more
-			     */
-	uint64_t reserved;
-};
-
-struct fuse_famfs_fmap_header {
-	uint8_t file_type; /* enum famfs_file_type */
-	uint8_t reserved;
-	uint16_t fmap_version;
-	uint32_t ext_type; /* enum famfs_log_ext_type */
-	uint32_t nextents;
-	/*
-	 * Total size of the fmap message in bytes (header + all extents). The
-	 * server always sets it. If the kernel's reply buffer (whose size the
-	 * server gets from the request's fuse_getxattr_in.size) is too small,
-	 * the server replies with only this header and fmap_size tells the
-	 * kernel how large a buffer to reallocate before retrying.
-	 */
-	uint32_t fmap_size;
-	uint64_t file_size;
-	uint64_t reserved1;
-};
-
-struct fuse_get_daxdev_in {
-	uint32_t        daxdev_num;
-};
-
-#define DAXDEV_NAME_MAX 256
-
-/* fuse_daxdev_out has enough space for a uuid if we need it */
-struct fuse_daxdev_out {
-	uint16_t index;
-	uint16_t reserved;
-	uint32_t reserved2;
-	uint64_t reserved3;
-	uint64_t reserved4;
-	char name[DAXDEV_NAME_MAX];
-};
-
-static __inline__ int32_t fmap_msg_min_size(void)
-{
-	/* Smallest fmap message is a header plus one simple extent */
-	return (sizeof(struct fuse_famfs_fmap_header)
-		+ sizeof(struct fuse_famfs_simple_ext));
-}
 
 #endif /* _LINUX_FUSE_H */

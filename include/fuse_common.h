@@ -96,8 +96,11 @@ struct fuse_file_info {
 	    file */
 	uint32_t parallel_direct_writes : 1;
 
+	uint32_t backing_id_is_64bit : 1;
+
 	/** Padding.  Reserved for future use*/
-	uint32_t padding : 23;
+
+	uint32_t padding : 22;
 	uint32_t padding2 : 32;
 	uint32_t padding3 : 32;
 
@@ -121,7 +124,8 @@ struct fuse_file_info {
 	/** struct fuse_file_info api and abi flags  */
 	uint64_t compat_flags;
 
-	uint64_t reserved[2];
+	uint64_t backing_id_64;
+	uint64_t reserved[1];
 };
 
 /**
@@ -516,11 +520,6 @@ struct fuse_loop_config_v1 {
  * Indicates that creation of idmapped mounts is allowed
  */
 #define FUSE_CAP_ALLOW_IDMAP (1ULL << 32)
-
-/**
- * handle files that use famfs dax fmaps
- */
-#define FUSE_CAP_DAX_FMAP (1UL << 33)
 
 /**
  * Ioctl flags

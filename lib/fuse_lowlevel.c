@@ -470,6 +470,8 @@ static void fill_entry(struct fuse_entry_out *arg,
 	arg->attr_valid = calc_timeout_sec(e->attr_timeout);
 	arg->attr_valid_nsec = calc_timeout_nsec(e->attr_timeout);
 	convert_stat(&e->attr, &arg->attr);
+	if (e->dax)
+		arg->attr.flags |= FUSE_ATTR_DAX;
 }
 
 /* `buf` is allowed to be empty so that the proper size may be
@@ -508,7 +510,10 @@ static void fill_open(struct fuse_open_out *arg,
 		      const struct fuse_file_info *f)
 {
 	arg->fh = f->fh;
-	if (f->backing_id > 0) {
+	if (f->backing_id_is_64bit) {
+		arg->backing_id_64 = f->backing_id_64;
+		arg->open_flags |= FOPEN_PASSTHROUGH | FUSE_BACKING_ID_64;
+	} else if (f->backing_id > 0) {
 		arg->backing_id = f->backing_id;
 		arg->open_flags |= FOPEN_PASSTHROUGH;
 	}
@@ -578,12 +583,16 @@ int fuse_reply_readlink(fuse_req_t req, const char *linkname)
 	return send_reply_ok(req, linkname, strlen(linkname));
 }
 
-int fuse_passthrough_open(fuse_req_t req, int fd)
+static int fuse_passthrough_open_flags(struct fuse_session *se, int fd, uint64_t backing_id, uint32_t flags)
 {
-	struct fuse_backing_map map = { .fd = fd };
+	struct fuse_backing_map map = {
+		.fd = fd,
+		.flags = flags,
+		.backing_id = backing_id,
+	};
 	int ret;
 
-	ret = ioctl(req->se->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
+	ret = ioctl(se->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
 	if (ret <= 0) {
 		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_open: %s\n", strerror(errno));
 		return 0;
@@ -592,25 +601,19 @@ int fuse_passthrough_open(fuse_req_t req, int fd)
 	return ret;
 }
 
-int fuse_daxdev_open(fuse_req_t req, int fd, int devindex)
+int fuse_passthrough_open(fuse_req_t req, int fd)
 {
-	struct fuse_backing_map map = { .fd = fd, .daxdev_index = devindex };
-	int ret;
+	return fuse_passthrough_open_flags(req->se, fd, 0, 0);
+}
 
-	ret = ioctl(req->se->fd, FUSE_DEV_IOC_DAXDEV_OPEN, &map);
-	if (ret < 0) {
-		fuse_log(FUSE_LOG_ERR, "fuse: daxdev_open(index=%d): %s\n",
-			 devindex, strerror(errno));
-		return 0;
-	}
+int fuse_passthrough_open2(struct fuse_session *se, int fd, uint64_t backing_id, int flags)
+{
+	int kflags = FUSE_BACKING_ID_64;
 
-	/*
-	 * DAXDEV_OPEN registers the daxdev by index and returns 0 on success
-	 * (unlike BACKING_OPEN, which returns a positive backing id). Report
-	 * success as a positive value so callers keep the ">0 == success,
-	 * 0 == failure" convention.
-	 */
-	return ret > 0 ? ret : 1;
+	if (flags & FUSE_PASSTHROUGH_IS_DEV)
+		kflags |= FUSE_BACKING_IS_DEV;
+
+	return fuse_passthrough_open_flags(se, fd, backing_id, kflags);
 }
 
 int fuse_passthrough_close(fuse_req_t req, int backing_id)
@@ -2810,8 +2813,6 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			se->conn.capable_ext |= FUSE_CAP_OVER_IO_URING;
 		if (inargflags & FUSE_ALLOW_IDMAP)
 			se->conn.capable_ext |= FUSE_CAP_ALLOW_IDMAP;
-		if (inargflags & FUSE_DAX_FMAP)
-			se->conn.capable_ext |= FUSE_CAP_DAX_FMAP;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -2977,8 +2978,6 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_REQUEST_TIMEOUT;
 		outarg.request_timeout = se->conn.request_timeout;
 	}
-	if (se->conn.want_ext & FUSE_CAP_DAX_FMAP)
-		outargflags |= FUSE_DAX_FMAP;
 
 	outarg.max_readahead = se->conn.max_readahead;
 	outarg.max_write = se->conn.max_write;
@@ -3080,30 +3079,6 @@ static void _do_destroy(fuse_req_t req, const fuse_ino_t nodeid,
 static void do_destroy(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 {
 	_do_destroy(req, nodeid, inarg, NULL);
-}
-
-static void
-do_get_fmap(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
-{
-	struct fuse_session *se = req->se;
-	struct fuse_getxattr_in *arg = (struct fuse_getxattr_in *) inarg;
-
-	if (se->op.get_fmap)
-		se->op.get_fmap(req, nodeid, arg->size);
-	else
-		fuse_reply_err(req, -EOPNOTSUPP);
-}
-
-static void
-do_get_daxdev(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
-{
-	struct fuse_session *se = req->se;
-	(void)inarg;
-
-	if (se->op.get_daxdev)
-		se->op.get_daxdev(req, nodeid); /* Use nodeid as daxdev_index */
-	else
-		fuse_reply_err(req, -EOPNOTSUPP);
 }
 
 static void list_del_nreq(struct fuse_notify_req *nreq)
@@ -3461,6 +3436,44 @@ int fuse_lowlevel_notify_prune(struct fuse_session *se,
 	return send_notify_iov(se, FUSE_NOTIFY_PRUNE, iov, 3);
 }
 
+int fuse_passthrough_close2(struct fuse_session *se, uint64_t backing_id)
+{
+	struct fuse_notify_backing_close_out outarg;
+	struct iovec iov[2];
+
+	memset(&outarg, 0, sizeof(outarg));
+	outarg.backing_id = backing_id;
+
+	iov[1].iov_base = &outarg;
+	iov[1].iov_len = sizeof(outarg);
+
+	return send_notify_iov(se, FUSE_NOTIFY_BACKING_CLOSE, iov, 2);
+}
+
+int fuse_ext_map_populate(struct fuse_session *se, uint64_t backing_id,
+			  unsigned int num_ext, struct fuse_extent *ext,
+			  unsigned int flags)
+{
+	struct fuse_notify_map_out outarg;
+	struct iovec iov[3];
+
+	memset(&outarg, 0, sizeof(outarg));
+	outarg.backing_id = backing_id;
+	outarg.num_extents = num_ext;
+	if (flags | FUSE_EXT_MAP_CREATE)
+		outarg.flags |= FUSE_MAP_BACKING_CREATE;
+	if (flags | FUSE_EXT_MAP_CYCLIC)
+		outarg.flags |= FUSE_MAP_CYCLIC;
+
+	iov[1].iov_base = &outarg;
+	iov[1].iov_len = sizeof(outarg);
+	iov[2].iov_base = ext;
+	iov[2].iov_len = sizeof(*ext) * num_ext;
+
+	return send_notify_iov(se, FUSE_NOTIFY_MAP, iov, 3);
+}
+
+
 void *fuse_req_userdata(fuse_req_t req)
 {
 	return req->se->userdata;
@@ -3498,6 +3511,11 @@ int fuse_req_interrupted(fuse_req_t req)
 bool fuse_req_is_uring(fuse_req_t req)
 {
 	return req->flags.is_uring;
+}
+
+struct fuse_session *fuse_req_session(fuse_req_t req)
+{
+	return req->se;
 }
 
 #ifndef HAVE_URING
@@ -3566,8 +3584,6 @@ static struct {
 	[FUSE_SYNCFS]	   = { do_syncfs,      "SYNCFS"      },
 	[FUSE_STATX]	   = { do_statx,       "STATX"	     },
 	[CUSE_INIT]	   = { cuse_lowlevel_init, "CUSE_INIT"   },
-	[FUSE_GET_FMAP]	   = { do_get_fmap, "GET_FMAP"       },
-	[FUSE_GET_DAXDEV]  = { do_get_daxdev, "GET_DAXDEV"   },
 };
 
 static struct {

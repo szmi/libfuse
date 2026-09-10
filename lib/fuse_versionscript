@@ -227,8 +227,10 @@ FUSE_3.19 {
 		fuse_session_start_teardown_watchdog;
 		fuse_session_stop_teardown_watchdog;
 		fuse_lowlevel_notify_prune;
-
-		fuse_daxdev_open;
+		fuse_ext_map_populate;
+		fuse_passthrough_open2;
+		fuse_passthrough_close2;
+		fuse_req_session;
 } FUSE_3.18;
 
 # Local Variables:
